@@ -1,32 +1,55 @@
 from flask import Flask, request, jsonify
-import os
 import re
 import requests
 from datetime import datetime, timezone, timedelta
 from slack_sdk import WebClient
 import logging
+import config  # Import the configuration settings
 
 app = Flask(__name__)
-
-# Placeholder for tokens and IDs
-GITHUB_TOKEN = 'GITHUB_TOKEN'
-SLACK_BOT_TOKEN = 'SLACK_BOT_TOKEN'
-SLACK_CHANNEL = 'CBU0KDSB1'  # Ensure this is correct
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-client = WebClient(token=os.environ['SLACK_BOT_TOKEN'])
+client = WebClient(token=config.SLACK_BOT_TOKEN)
 
-bot_user_id = client.auth_test().get('user_id')
+# Debugging statements to check if the Slack token is correct
+print(f"SLACK_BOT_TOKEN: {config.SLACK_BOT_TOKEN}")
+
+try:
+    bot_user_id = config.get_slack_bot_user_id(client)
+except Exception as e:
+    logger.error(f"Error getting bot user ID: {e}")
+    raise
 
 latest_ts = "0"
+
+sheets_service = config.initialize_sheets_api()
 
 def fetch_and_parse_codeowners(repo_owner, repo_name):
     # Fetch the CODEOWNERS file content from the GitHub repository
     # Parse the file to determine code owners
-    # Return a list or set of code owner GitHub usernames
+    # Return a list or set of code owner Git
+    # Hub usernames
     return {"codeowner1", "codeowner2"}
+
+def append_to_sheet(service, data):
+    range_name = 'Sheet1!A8'
+    logger.debug(f"Appending to range: {range_name} with data: {data}")
+    sheet = service.spreadsheets()
+    body = {'values': [data]}
+    try:
+        result = sheet.values().append(
+            spreadsheetId=config.SPREADSHEET_ID,
+            range=range_name,
+            valueInputOption='RAW',
+            insertDataOption='INSERT_ROWS',  # Ensure new rows are inserted
+            body=body
+        ).execute()
+        logger.debug(f"Appended to sheet: {result}")
+    except Exception as e:
+        logger.error(f"Failed to append to sheet: {e}")
+        raise
 
 @app.route('/slack/events', methods=['POST'])
 def slack_events():
@@ -54,12 +77,13 @@ def slack_events():
         if match:
             repo_owner, repo_name, pr_number = match.groups()
             pr_details_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/pulls/{pr_number}"
-            pr_details_response = requests.get(pr_details_url, headers={'Authorization': f'token {GITHUB_TOKEN}'})
+            pr_details_response = requests.get(pr_details_url, headers={'Authorization': f'token {config.GITHUB_TOKEN}'})
             if pr_details_response.status_code == 200:
                 pr_data = pr_details_response.json()
+                pr_submitter = pr_data['user']['login']  # Get the PR submitter's username
                 head_sha = pr_data['head']['sha']
                 checks_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/commits/{head_sha}/check-runs"
-                checks_response = requests.get(checks_url, headers={'Authorization': f'token {GITHUB_TOKEN}', 'Accept': 'application/vnd.github.v3+json'})
+                checks_response = requests.get(checks_url, headers={'Authorization': f'token {config.GITHUB_TOKEN}', 'Accept': 'application/vnd.github.v3+json'})
 
                 # Time difference calculation
                 review_requested_at = pr_data.get('created_at')
@@ -92,7 +116,7 @@ def slack_events():
         
         # Fetch the list of requested reviewers
         review_requests_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/pulls/{pr_number}/requested_reviewers"
-        review_requests_response = requests.get(review_requests_url, headers={'Authorization': f'token {GITHUB_TOKEN}'})
+        review_requests_response = requests.get(review_requests_url, headers={'Authorization': f'token {config.GITHUB_TOKEN}'})
         review_requests_data = review_requests_response.json() if review_requests_response.status_code == 200 else {}
 
         requested_reviewers = {reviewer['login'] for reviewer in review_requests_data.get('users', [])}
@@ -100,7 +124,7 @@ def slack_events():
         
         # Fetch the list of PR reviews to check if a non-code owner has reviewed it
         reviews_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/pulls/{pr_number}/reviews"
-        reviews_response = requests.get(reviews_url, headers={'Authorization': f'token {GITHUB_TOKEN}'})
+        reviews_response = requests.get(reviews_url, headers={'Authorization': f'token {config.GITHUB_TOKEN}'})
         reviews_data = reviews_response.json() if reviews_response.status_code == 200 else []
 
         non_code_owner_reviews = [review['user']['login'] for review in reviews_data if review['user']['login'] not in code_owners and review['state'].lower() == 'approved']
@@ -116,11 +140,26 @@ def slack_events():
         # Use `review_status_message` in your message to Slack
         message = f"{review_status_message} {message}"
 
+        try:
+            # Append response to Google Sheets
+            append_to_sheet(sheets_service, [
+                pr_submitter,  # Include the PR submitter's username
+                repo_name, 
+                pr_number, 
+                review_status_message, 
+                message, 
+                datetime.now().isoformat(),
+                review_requested_at  # Include the review requested timestamp
+            ])
+        except Exception as e:
+            logger.error(f"Error appending to sheet: {e}")
+        
         response = client.chat_postMessage(channel=channel_id, text=message, thread_ts=thread_ts)
         if response.status_code == 200:
             logger.debug("Message posted to Slack")
         else:
-            logger.debug("Failed to post message to Slack")
+            logger.debug(f"Failed to post message to Slack: {response['error']}")
+
         return jsonify({'status': 'ok'}), 200
 
     return jsonify({'status': 'ignored'}), 200
